@@ -1,8 +1,8 @@
-#![feature(iter_next_chunk)]
+#![feature(bufreader_peek, iter_next_chunk)]
 
 use std::{
     collections::HashSet,
-    io::{Read, stdin},
+    io::{BufRead, BufReader, Read, stdin},
     process::exit,
 };
 
@@ -26,7 +26,9 @@ struct MPEGPacket {
 }
 
 impl MPEGPacket {
-    fn parse_from_stream(stream: &TransportStream) -> Result<Self, ParseError> {
+    fn parse_from_stream<Reader: Read>(
+        stream: &mut TransportStream<Reader>,
+    ) -> Result<Self, ParseError> {
         let packet = stream.get_range::<PACKET_SIZE>();
 
         let sync = packet[0];
@@ -50,14 +52,16 @@ impl MPEGPacket {
 }
 
 /// A wrapper around a stream, which could be a socket, or file
-struct TransportStream {
-    buffer: Vec<u8>,
-    cursor: usize,
+struct TransportStream<Reader: Read> {
+    buffer: BufReader<Reader>,
     pids: HashSet<u16>,
     packet_count: usize,
 }
 
-impl Iterator for TransportStream {
+impl<Reader> Iterator for TransportStream<Reader>
+where
+    Reader: Read,
+{
     type Item = Result<MPEGPacket, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -65,53 +69,41 @@ impl Iterator for TransportStream {
     }
 }
 
-impl TransportStream {
-    fn from_reader<Reader>(mut reader: Reader) -> std::io::Result<Self>
-    where
-        Reader: Read,
-    {
-        // This could probably be held in some sort of temporary buffer that's smaller,
-        // or can be made to hold only a specific capacity in order to keep memory footprint
-        // down, as well as make it more suitable to streaming the content in, but for
-        // simplicity's sake this works fine
-        let mut buffer = Vec::default();
-        reader.read_to_end(&mut buffer)?;
-
-        Ok(Self {
+impl<Reader> TransportStream<Reader>
+where
+    Reader: Read,
+{
+    fn from_reader(reader: Reader) -> Self {
+        let mut buffer = BufReader::with_capacity(PACKET_SIZE * 4, reader);
+        let _ = buffer.fill_buf();
+        Self {
             buffer,
-            cursor: 0,
             pids: HashSet::default(),
             packet_count: 0,
-        })
+        }
     }
 
-    fn peek(&self) -> Option<u8> {
-        if self.cursor >= self.buffer.len() {
-            None
-        } else {
-            Some(self.buffer[self.cursor])
-        }
+    fn peek(&mut self) -> Option<u8> {
+        self.get(0)
     }
 
     fn next_byte(&mut self) -> u8 {
-        let byte = self.buffer[self.cursor];
-        self.cursor += 1;
-        byte
+        let mut buf = [0u8; 1];
+        let _ = self.buffer.read(&mut buf[..]);
+        buf[0]
     }
 
-    fn get(&self, at: usize) -> Option<u8> {
-        if self.buffer.len() <= at {
-            None
-        } else {
-            Some(self.buffer[at])
+    fn get(&mut self, at: usize) -> Option<u8> {
+        match self.buffer.peek(at + 1) {
+            Err(_) => None,
+            Ok(&[]) => None,
+            Ok(bytes) if bytes.len() < at + 1 => None,
+            Ok(&[.., byte]) => Some(byte),
         }
     }
 
-    fn get_range<const N: usize>(&self) -> &[u8] {
-        // TODO: Figure out why the provided success file actually doesn't
-        // contain a multiple of `PACKET_SIZE` packets ...
-        let end = std::cmp::min(self.cursor + N, self.buffer.len());
-        &self.buffer[self.cursor..end]
+    fn get_range<const N: usize>(&mut self) -> &[u8] {
+        self.buffer.peek(N).unwrap()
     }
 
     /// Read a single packet from the provided stream
@@ -127,24 +119,24 @@ impl TransportStream {
             self.next_byte(); // Ignore the first one, as we peeked it earlier
 
             // Only look up to 1 packet away
-            for _ in 0..PACKET_SIZE {
+            for idx in 1..PACKET_SIZE {
                 if self.peek()? == SYNC_BYTE
                         // If we've found a sync byte, then if another sync byte exists
                         // exactly 1 packet away, ...
                         && self
-                            .get(self.cursor + PACKET_SIZE)
+                            .get(PACKET_SIZE)
                             .is_some_and(|b| b == SYNC_BYTE)
                         // and another two exist (or there's not enough data) at `PACKET_SIZE`
                         // offsets ...
                         && self
-                            .get(self.cursor + PACKET_SIZE * 2)
+                            .get(PACKET_SIZE * 2)
                             .is_none_or(|b| b == SYNC_BYTE)
                         && self
-                            .get(self.cursor + PACKET_SIZE * 3)
+                            .get(PACKET_SIZE * 3)
                             .is_none_or(|b| b == SYNC_BYTE)
                 {
                     // Then basically assume that this is the proper start of the next packet
-                    return Some(Err(ParseError::PartialPacket(self.cursor)));
+                    return Some(Err(ParseError::PartialPacket(idx)));
                 }
 
                 self.next_byte();
@@ -162,7 +154,7 @@ impl TransportStream {
             self.packet_count += 1;
         }
 
-        self.cursor += PACKET_SIZE;
+        self.buffer.consume(PACKET_SIZE);
 
         Some(packet)
     }
@@ -171,8 +163,7 @@ impl TransportStream {
 fn main() {
     let mut offset = 0;
 
-    let mut stream =
-        TransportStream::from_reader(stdin()).expect("Unable to create TransportStream");
+    let mut stream = TransportStream::from_reader(stdin());
 
     match stream.next() {
         Some(Ok(_packet)) => {
@@ -229,7 +220,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TransportStream::from_reader(packet).unwrap();
+        let stream = TransportStream::from_reader(packet);
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -265,7 +256,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TransportStream::from_reader(packet).unwrap();
+        let stream = TransportStream::from_reader(packet);
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -329,7 +320,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TransportStream::from_reader(packet).unwrap();
+        let stream = TransportStream::from_reader(packet);
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -356,7 +347,7 @@ mod test {
         let packets = include_bytes!("tests/test_success.ts");
 
         let stream = Cursor::new(&packets);
-        let mut stream = TransportStream::from_reader(stream).unwrap();
+        let mut stream = TransportStream::from_reader(stream);
 
         for packet in &mut stream {
             assert!(packet.is_ok());
@@ -373,7 +364,7 @@ mod test {
         let packets = include_bytes!("tests/test_failure.ts");
 
         let stream = Cursor::new(&packets);
-        let mut stream = TransportStream::from_reader(stream).unwrap();
+        let mut stream = TransportStream::from_reader(stream);
 
         let mut offset = 0;
 
