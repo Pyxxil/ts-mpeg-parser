@@ -14,9 +14,6 @@ const SYNC_BYTE: u8 = 0x47;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Error {
-    // Not currently constructed as I haven't quite figured out the
-    // best way to handle this yet...
-    #[allow(dead_code)]
     PartialPacket(usize),
     InvalidPacket,
 }
@@ -33,6 +30,7 @@ struct MPEGPacket {
 struct TSStream<Stream: Read> {
     stream: Peekable<Bytes<BufReader<Stream>>>,
     pids: HashSet<u16>,
+    packet_count: usize,
 }
 
 impl<Stream: Read> Iterator for TSStream<Stream> {
@@ -54,12 +52,50 @@ where
             // so should be fine for this usecase
             stream: BufReader::new(stream).bytes().peekable(),
             pids: HashSet::default(),
+            packet_count: 0,
         }
     }
 
     /// Read a single packet from the provided stream
+    ///
+    /// NOTE: A few issues with approach:
+    ///  - If we knew the size of the stream upfront, then realistically this part might not
+    ///    be needed, as if the size isn't a multiple of `PACKET_SIZE`, then the first byte has
+    ///    to be a partial packet... however,
+    ///  - If the content is a stream, and thus we can't technically know the length, then
+    ///    realistically any byte between 0..`PACKET_SIZE` - 1 could be the start of a new packet,
+    ///    but because the payload can contain any possible byte, this could be rather off ...
+    ///
+    /// The latter approach is currently taken, as the former lead to results not consistent
+    /// with the provided example inputs. It also seemed to make more sense to me (despite the
+    /// downsides), as a stream seems most likely. However, it may be more accurate to take the
+    /// former approach.
     fn read_packet(&mut self) -> Option<Result<MPEGPacket, Error>> {
-        self.stream.peek()?;
+        let start = self.stream.peek()?;
+
+        // This is rather crude (and is very possibly not the correct approach), but
+        // if the first byte isn't the SYNC_BYTE then either this packet is invalid,
+        // or it's a partial packet..
+        if start.as_ref().is_ok_and(|byte| *byte != SYNC_BYTE) {
+            if self.packet_count > 0 {
+                return Some(Err(Error::InvalidPacket));
+            }
+
+            let _ = start.iter().next();
+            let mut idx = 0;
+            while let Ok(byte) = self.stream.peek()? {
+                if idx >= PACKET_SIZE {
+                    return Some(Err(Error::InvalidPacket));
+                } else if *byte == SYNC_BYTE {
+                    return Some(Err(Error::PartialPacket(idx)));
+                }
+
+                idx += 1;
+                let _ = self.stream.next()?;
+            }
+
+            return Some(Err(Error::InvalidPacket));
+        }
 
         // Grab the next packet out
         let packet = self.stream.next_chunk::<PACKET_SIZE>().map_or_else(
@@ -92,20 +128,19 @@ where
         };
 
         self.pids.insert(pid);
+        self.packet_count += 1;
 
         Some(Ok(packet))
     }
 }
 
 fn main() {
-    let mut packet_count = 0;
     let mut offset = 0;
 
     let mut stream = TSStream::new(stdin());
     match stream.next() {
         Some(Ok(_packet)) => {
             offset += PACKET_SIZE;
-            packet_count += 1;
         }
         Some(Err(Error::PartialPacket(off))) => {
             // Ignore the first packet if it's a partial packet
@@ -113,7 +148,10 @@ fn main() {
         }
         Some(Err(Error::InvalidPacket)) => {
             // TODO: What should happen if the first packet is invalid? Discard it? Is it a partial packet?
-            println!("Error: No sync byte present in packet {packet_count}, offset {offset}",);
+            println!(
+                "Error: No sync byte present in packet {}, offset {offset}",
+                stream.packet_count
+            );
             exit(1);
         }
         None => exit(0),
@@ -121,10 +159,12 @@ fn main() {
 
     for packet in &mut stream {
         if let Ok(_packet) = packet {
-            packet_count += 1;
             offset += PACKET_SIZE;
         } else {
-            println!("Error: No sync byte present in packet {packet_count}, offset {offset}");
+            println!(
+                "Error: No sync byte present in packet {}, offset {offset}",
+                stream.packet_count
+            );
             exit(1);
         }
     }
@@ -140,7 +180,7 @@ fn main() {
 mod test {
     use std::{collections::HashSet, io::Cursor};
 
-    use crate::{MPEGPacket, PACKET_SIZE, SYNC_BYTE, TSStream};
+    use crate::{Error, MPEGPacket, PACKET_SIZE, SYNC_BYTE, TSStream};
 
     #[test]
     fn single_packet() {
@@ -222,6 +262,44 @@ mod test {
     }
 
     #[test]
+    fn test_partial_first_packet() {
+        const OFFSET: usize = 180;
+        let mut packet = Vec::default();
+        packet.extend([0u8; OFFSET]);
+
+        packet.push(SYNC_BYTE);
+        packet.push(0xEF);
+        packet.push(0xFF);
+
+        packet.extend([0u8; 185]);
+
+        let packet = Cursor::new(&packet);
+
+        let stream = TSStream::new(packet);
+        let mut stream = stream.into_iter();
+        let packet = stream.next();
+        assert!(packet.is_some());
+
+        let packet = packet.unwrap();
+        assert_eq!(Err(Error::PartialPacket(OFFSET)), packet);
+
+        let packet = stream.next();
+        assert!(packet.is_some());
+        let packet = packet.unwrap();
+        assert_eq!(
+            Ok(MPEGPacket {
+                _sync: SYNC_BYTE,
+                _flags: 0x7,
+                _pid: 0xFFF,
+                _payload: vec![0u8; 185],
+            }),
+            packet
+        );
+
+        assert!(stream.next().is_none());
+    }
+
+    #[test]
     fn test_success_file() {
         let packets = include_bytes!("tests/test_success.ts");
 
@@ -243,22 +321,21 @@ mod test {
         let packets = include_bytes!("tests/test_failure.ts");
 
         let stream = Cursor::new(&packets);
-        let stream = TSStream::new(stream);
+        let mut stream = TSStream::new(stream);
 
         let mut offset = 0;
-        let mut found_invalid_packet = false;
 
-        for (packet_count, packet) in stream.enumerate() {
-            if packet.is_err() {
-                assert_eq!(packet_count, 20535);
+        for packet in &mut stream {
+            if let Ok(_packet) = packet {
+                offset += PACKET_SIZE;
+            } else {
+                assert_eq!(stream.packet_count, 20535);
                 assert_eq!(offset, 3860580);
 
-                found_invalid_packet = true;
+                return;
             }
-
-            offset += PACKET_SIZE;
         }
 
-        assert!(found_invalid_packet)
+        panic!("Failed to find an invalid packet");
     }
 }
