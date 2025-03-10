@@ -2,8 +2,7 @@
 
 use std::{
     collections::HashSet,
-    io::{BufReader, Bytes, Read, stdin},
-    iter::Peekable,
+    io::{Read, stdin},
     process::exit,
 };
 
@@ -27,13 +26,14 @@ struct MPEGPacket {
 }
 
 /// A wrapper around a stream, which could be a socket, or file
-struct TSStream<Stream: Read> {
-    stream: Peekable<Bytes<BufReader<Stream>>>,
+struct TSStream {
+    buffer: Vec<u8>,
+    cursor: usize,
     pids: HashSet<u16>,
     packet_count: usize,
 }
 
-impl<Stream: Read> Iterator for TSStream<Stream> {
+impl Iterator for TSStream {
     type Item = Result<MPEGPacket, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -41,77 +41,101 @@ impl<Stream: Read> Iterator for TSStream<Stream> {
     }
 }
 
-impl<Stream> TSStream<Stream>
-where
-    Stream: Read,
-{
+impl TSStream {
     /// Create a new `TSStream` wrapper around an underlying stream
-    fn new(stream: Stream) -> Self {
+    fn new<Stream>(mut stream: Stream) -> Self
+    where
+        Stream: Read,
+    {
+        // This could probably be held in some sort of temporary buffer that's smaller,
+        // or can be made to hold on a specific capacity in order to keep memory footprint
+        // down, as well as make it more suitable to streaming the content in, but for
+        // simplicity's sake this works fine
+        let mut buffer = Vec::default();
+        let _ = stream.read_to_end(&mut buffer);
+
         Self {
-            // Buffer the stream in memory. Technically this is only really useful for files/sockets,
-            // so should be fine for this usecase
-            stream: BufReader::new(stream).bytes().peekable(),
+            buffer,
+            cursor: 0,
             pids: HashSet::default(),
             packet_count: 0,
         }
     }
 
+    fn peek(&self) -> Option<u8> {
+        if self.cursor >= self.buffer.len() {
+            None
+        } else {
+            Some(self.buffer[self.cursor])
+        }
+    }
+
+    fn next_byte(&mut self) -> u8 {
+        let byte = self.buffer[self.cursor];
+        self.cursor += 1;
+        byte
+    }
+
+    fn get(&self, at: usize) -> Option<u8> {
+        if self.buffer.len() <= at {
+            None
+        } else {
+            Some(self.buffer[at])
+        }
+    }
+
+    fn get_range<const N: usize>(&self) -> &[u8] {
+        // TODO: Figure out why the provided success file actually doesn't
+        // contain a multiple of `PACKET_SIZE` packets ...
+        let end = std::cmp::min(self.cursor + N, self.buffer.len());
+        &self.buffer[self.cursor..end]
+    }
+
     /// Read a single packet from the provided stream
     ///
-    /// NOTE: A few issues with approach:
-    ///  - If we knew the size of the stream upfront, then realistically this part might not
-    ///    be needed, as if the size isn't a multiple of `PACKET_SIZE`, then the first byte has
-    ///    to be a partial packet... however,
-    ///  - If the content is a stream, and thus we can't technically know the length, then
-    ///    realistically any byte between 0..`PACKET_SIZE` - 1 could be the start of a new packet,
-    ///    but because the payload can contain any possible byte, this could be rather off ...
-    ///
-    /// The latter approach is currently taken, as the former lead to results not consistent
-    /// with the provided example inputs. It also seemed to make more sense to me (despite the
-    /// downsides), as a stream seems most likely. However, it may be more accurate to take the
-    /// former approach.
+    /// NOTE: This uses a basic heuristic to check for partial packets.
     fn read_packet(&mut self) -> Option<Result<MPEGPacket, Error>> {
-        let start = self.stream.peek()?;
+        let byte = self.peek()?;
 
         // This is rather crude (and is very possibly not the correct approach), but
         // if the first byte isn't the SYNC_BYTE then either this packet is invalid,
         // or it's a partial packet..
-        if start.as_ref().is_ok_and(|byte| *byte != SYNC_BYTE) {
-            if self.packet_count > 0 {
-                return Some(Err(Error::InvalidPacket));
-            }
+        if byte != SYNC_BYTE {
+            self.next_byte(); // Ignore the first one, as we peeked it earlier
 
-            let _ = start.iter().next();
-            let mut idx = 0;
-            while let Ok(byte) = self.stream.peek()? {
-                if idx >= PACKET_SIZE {
-                    return Some(Err(Error::InvalidPacket));
-                } else if *byte == SYNC_BYTE {
-                    return Some(Err(Error::PartialPacket(idx)));
+            // Only look up to 1 packet away
+            for _ in 0..PACKET_SIZE {
+                if self.peek()? == SYNC_BYTE
+                        // If we've found a sync byte, then if another sync byte exists
+                        // exactly 1 packet away, ...
+                        && self
+                            .get(self.cursor + PACKET_SIZE)
+                            .is_some_and(|b| b == SYNC_BYTE)
+                        // and another two exist (or there's not enough data) at `PACKET_SIZE`
+                        // offsets ...
+                        && self
+                            .get(self.cursor + PACKET_SIZE * 2)
+                            .is_none_or(|b| b == SYNC_BYTE)
+                        && self
+                            .get(self.cursor + PACKET_SIZE * 3)
+                            .is_none_or(|b| b == SYNC_BYTE)
+                {
+                    // Then basically assume that this is the proper start of the next packet
+                    return Some(Err(Error::PartialPacket(self.cursor)));
                 }
 
-                idx += 1;
-                let _ = self.stream.next()?;
+                self.next_byte();
             }
 
+            // Otherwise, we can't find an obvious starting point, so it's invalid
             return Some(Err(Error::InvalidPacket));
         }
 
         // Grab the next packet out
-        let packet = self.stream.next_chunk::<PACKET_SIZE>().map_or_else(
-            // If there's too little data, it's most likely this is an incomplete packet? However, for some reason,
-            // this still seems to pass just fine for the examples provided...
-            |e| e.flatten().collect::<Vec<_>>(),
-            // Otherwise, there's enough data in the stream to work with
-            |packet| {
-                packet
-                    .iter()
-                    .flat_map(|byte| byte.as_ref().cloned())
-                    .collect::<Vec<_>>()
-            },
-        );
+        let packet = self.get_range::<PACKET_SIZE>();
 
         let sync = packet[0];
+        // This should have been checked for above, but may as well play it safe ...
         if sync != SYNC_BYTE {
             return Some(Err(Error::InvalidPacket));
         }
@@ -129,6 +153,7 @@ where
 
         self.pids.insert(pid);
         self.packet_count += 1;
+        self.cursor += PACKET_SIZE;
 
         Some(Ok(packet))
     }
@@ -273,6 +298,24 @@ mod test {
 
         packet.extend([0u8; 185]);
 
+        packet.push(SYNC_BYTE);
+        packet.push(0xEF);
+        packet.push(0xFF);
+
+        packet.extend([0u8; 185]);
+
+        packet.push(SYNC_BYTE);
+        packet.push(0xEF);
+        packet.push(0xFF);
+
+        packet.extend([0u8; 185]);
+
+        packet.push(SYNC_BYTE);
+        packet.push(0xEF);
+        packet.push(0xFF);
+
+        packet.extend([0u8; 185]);
+
         let packet = Cursor::new(&packet);
 
         let stream = TSStream::new(packet);
@@ -295,8 +338,6 @@ mod test {
             }),
             packet
         );
-
-        assert!(stream.next().is_none());
     }
 
     #[test]
