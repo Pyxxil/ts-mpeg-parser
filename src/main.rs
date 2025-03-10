@@ -66,24 +66,23 @@ impl Iterator for TransportStream {
 }
 
 impl TransportStream {
-    /// Create a new `TSStream` wrapper around an underlying stream
-    fn new<Stream>(mut stream: Stream) -> Self
+    fn from_reader<Reader>(mut reader: Reader) -> std::io::Result<Self>
     where
-        Stream: Read,
+        Reader: Read,
     {
         // This could probably be held in some sort of temporary buffer that's smaller,
-        // or can be made to hold on a specific capacity in order to keep memory footprint
+        // or can be made to hold only a specific capacity in order to keep memory footprint
         // down, as well as make it more suitable to streaming the content in, but for
         // simplicity's sake this works fine
         let mut buffer = Vec::default();
-        let _ = stream.read_to_end(&mut buffer);
+        reader.read_to_end(&mut buffer)?;
 
-        Self {
+        Ok(Self {
             buffer,
             cursor: 0,
             pids: HashSet::default(),
             packet_count: 0,
-        }
+        })
     }
 
     fn peek(&self) -> Option<u8> {
@@ -172,7 +171,9 @@ impl TransportStream {
 fn main() {
     let mut offset = 0;
 
-    let mut stream = TransportStream::new(stdin());
+    let mut stream =
+        TransportStream::from_reader(stdin()).expect("Unable to create TransportStream");
+
     match stream.next() {
         Some(Ok(_packet)) => {
             offset += PACKET_SIZE;
@@ -228,7 +229,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TransportStream::new(packet);
+        let stream = TransportStream::from_reader(packet).unwrap();
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -264,7 +265,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TransportStream::new(packet);
+        let stream = TransportStream::from_reader(packet).unwrap();
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -328,7 +329,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TransportStream::new(packet);
+        let stream = TransportStream::from_reader(packet).unwrap();
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -355,7 +356,7 @@ mod test {
         let packets = include_bytes!("tests/test_success.ts");
 
         let stream = Cursor::new(&packets);
-        let mut stream = TransportStream::new(stream);
+        let mut stream = TransportStream::from_reader(stream).unwrap();
 
         for packet in &mut stream {
             assert!(packet.is_ok());
@@ -372,7 +373,7 @@ mod test {
         let packets = include_bytes!("tests/test_failure.ts");
 
         let stream = Cursor::new(&packets);
-        let mut stream = TransportStream::new(stream);
+        let mut stream = TransportStream::from_reader(stream).unwrap();
 
         let mut offset = 0;
 
