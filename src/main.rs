@@ -138,9 +138,9 @@ fn main() {
 
 #[cfg(test)]
 mod test {
-    use std::io::Cursor;
+    use std::{collections::HashSet, io::Cursor};
 
-    use crate::{MPEGPacket, SYNC_BYTE, TSStream};
+    use crate::{MPEGPacket, PACKET_SIZE, SYNC_BYTE, TSStream};
 
     #[test]
     fn single_packet() {
@@ -219,5 +219,46 @@ mod test {
         );
 
         assert!(stream.next().is_none());
+    }
+
+    #[test]
+    fn test_success_file() {
+        let packets = include_bytes!("tests/test_success.ts");
+
+        let stream = Cursor::new(&packets);
+        let mut stream = TSStream::new(stream);
+
+        for packet in &mut stream {
+            assert!(packet.is_ok());
+        }
+
+        let mut pids = HashSet::default();
+        pids.extend([0x0, 0x11, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x1fff]);
+
+        assert_eq!(stream.pids, pids)
+    }
+
+    #[test]
+    fn test_failure_file() {
+        let packets = include_bytes!("tests/test_failure.ts");
+
+        let stream = Cursor::new(&packets);
+        let stream = TSStream::new(stream);
+
+        let mut offset = 0;
+        let mut found_invalid_packet = false;
+
+        for (packet_count, packet) in stream.enumerate() {
+            if packet.is_err() {
+                assert_eq!(packet_count, 20535);
+                assert_eq!(offset, 3860580);
+
+                found_invalid_packet = true;
+            }
+
+            offset += PACKET_SIZE;
+        }
+
+        assert!(found_invalid_packet)
     }
 }
