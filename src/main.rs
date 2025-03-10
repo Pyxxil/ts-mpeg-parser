@@ -12,6 +12,7 @@ const PACKET_SIZE: usize = 188;
 // Every packet begins with a “sync byte” which has hex value 0x47
 const SYNC_BYTE: u8 = 0x47;
 
+#[derive(Debug, PartialEq, Eq)]
 enum Error {
     // Not currently constructed as I haven't quite figured out the
     // best way to handle this yet...
@@ -20,7 +21,7 @@ enum Error {
     InvalidPacket,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct MPEGPacket {
     _sync: u8,
     _flags: u8,
@@ -132,5 +133,91 @@ fn main() {
     pids.sort();
     for pid in pids {
         println!("0x{pid:x}");
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Cursor;
+
+    use crate::{MPEGPacket, SYNC_BYTE, TSStream};
+
+    #[test]
+    fn single_packet() {
+        let mut packet = Vec::default();
+        packet.push(SYNC_BYTE);
+        packet.push(0);
+        packet.push(0);
+
+        packet.extend([0u8; 185]);
+
+        let packet = Cursor::new(&packet);
+
+        let stream = TSStream::new(packet);
+        let mut stream = stream.into_iter();
+        let packet = stream.next();
+        assert!(packet.is_some());
+
+        let packet = packet.unwrap();
+        assert_eq!(
+            Ok(MPEGPacket {
+                _sync: SYNC_BYTE,
+                _flags: 0,
+                _pid: 0,
+                _payload: vec![0u8; 185],
+            }),
+            packet
+        );
+
+        assert!(stream.next().is_none());
+    }
+
+    #[test]
+    fn multi_packet() {
+        let mut packet = Vec::default();
+        packet.push(SYNC_BYTE);
+        packet.push(0);
+        packet.push(0);
+
+        packet.extend([0u8; 185]);
+
+        packet.push(SYNC_BYTE);
+        packet.push(0xEF);
+        packet.push(0xFF);
+
+        packet.extend([0u8; 185]);
+
+        let packet = Cursor::new(&packet);
+
+        let stream = TSStream::new(packet);
+        let mut stream = stream.into_iter();
+        let packet = stream.next();
+        assert!(packet.is_some());
+
+        let packet = packet.unwrap();
+        assert_eq!(
+            Ok(MPEGPacket {
+                _sync: SYNC_BYTE,
+                _flags: 0,
+                _pid: 0,
+                _payload: vec![0u8; 185],
+            }),
+            packet
+        );
+
+        let packet = stream.next();
+        assert!(packet.is_some());
+        let packet = packet.unwrap();
+        assert_eq!(
+            Ok(MPEGPacket {
+                _sync: SYNC_BYTE,
+                _flags: 0x7,
+                _pid: 0xFFF,
+                _payload: vec![0u8; 185],
+            }),
+            packet
+        );
+
+        assert!(stream.next().is_none());
     }
 }
