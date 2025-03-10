@@ -18,14 +18,14 @@ enum ParseError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct MPEGPacket {
+struct Packet {
     _sync: u8,
     _flags: u8,
     pid: u16,
     _payload: Vec<u8>,
 }
 
-impl MPEGPacket {
+impl Packet {
     fn parse_from_stream<Reader: Read>(
         stream: &mut TransportStream<Reader>,
     ) -> Result<Self, ParseError> {
@@ -63,7 +63,7 @@ impl<Reader> Iterator for TransportStream<Reader>
 where
     Reader: Read,
 {
-    type Item = Result<MPEGPacket, ParseError>;
+    type Item = Result<Packet, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.read_packet()
@@ -109,7 +109,7 @@ where
     /// Read a single packet from the provided stream
     ///
     /// NOTE: This uses a basic heuristic to check for partial packets.
-    fn read_packet(&mut self) -> Option<Result<MPEGPacket, ParseError>> {
+    fn read_packet(&mut self) -> Option<Result<Packet, ParseError>> {
         let byte = self.peek()?;
 
         // This is rather crude (and is very possibly not the correct approach), but
@@ -147,7 +147,7 @@ where
         }
 
         // Grab the next packet out
-        let packet = MPEGPacket::parse_from_stream(self);
+        let packet = Packet::parse_from_stream(self);
 
         if let Ok(ref packet) = packet {
             self.pids.insert(packet.pid);
@@ -205,7 +205,7 @@ fn main() {
 mod test {
     use std::{collections::HashSet, io::Cursor};
 
-    use crate::{MPEGPacket, PACKET_SIZE, ParseError, SYNC_BYTE, TransportStream};
+    use crate::{PACKET_SIZE, Packet, ParseError, SYNC_BYTE, TransportStream};
 
     #[test]
     fn single_packet() {
@@ -225,7 +225,7 @@ mod test {
 
         let packet = packet.unwrap();
         assert_eq!(
-            Ok(MPEGPacket {
+            Ok(Packet {
                 _sync: SYNC_BYTE,
                 _flags: 0,
                 pid: 0,
@@ -261,7 +261,7 @@ mod test {
 
         let packet = packet.unwrap();
         assert_eq!(
-            Ok(MPEGPacket {
+            Ok(Packet {
                 _sync: SYNC_BYTE,
                 _flags: 0,
                 pid: 0,
@@ -274,7 +274,7 @@ mod test {
         assert!(packet.is_some());
         let packet = packet.unwrap();
         assert_eq!(
-            Ok(MPEGPacket {
+            Ok(Packet {
                 _sync: SYNC_BYTE,
                 _flags: 0x7,
                 pid: 0xFFF,
@@ -330,7 +330,7 @@ mod test {
         assert!(packet.is_some());
         let packet = packet.unwrap();
         assert_eq!(
-            Ok(MPEGPacket {
+            Ok(Packet {
                 _sync: SYNC_BYTE,
                 _flags: 0x7,
                 pid: 0xFFF,
