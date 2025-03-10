@@ -29,7 +29,8 @@ impl MPEGPacket {
     fn parse_from_stream<Reader: Read>(
         stream: &mut TransportStream<Reader>,
     ) -> Result<Self, ParseError> {
-        let packet = stream.get_range::<PACKET_SIZE>();
+        let mut packet = [0u8; PACKET_SIZE];
+        let _ = stream.read(&mut packet);
 
         let sync = packet[0];
         if sync != SYNC_BYTE {
@@ -95,15 +96,14 @@ where
 
     fn get(&mut self, at: usize) -> Option<u8> {
         match self.buffer.peek(at + 1) {
-            Err(_) => None,
-            Ok(&[]) => None,
+            Err(_) | Ok(&[]) => None,
             Ok(bytes) if bytes.len() < at + 1 => None,
             Ok(&[.., byte]) => Some(byte),
         }
     }
 
-    fn get_range<const N: usize>(&mut self) -> &[u8] {
-        self.buffer.peek(N).unwrap()
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.buffer.read_exact(&mut buf[..])
     }
 
     /// Read a single packet from the provided stream
@@ -153,8 +153,6 @@ where
             self.pids.insert(packet.pid);
             self.packet_count += 1;
         }
-
-        self.buffer.consume(PACKET_SIZE);
 
         Some(packet)
     }
