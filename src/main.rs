@@ -12,7 +12,7 @@ const PACKET_SIZE: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
 
 #[derive(Debug, PartialEq, Eq)]
-enum Error {
+enum ParseError {
     PartialPacket(usize),
     InvalidPacket,
 }
@@ -21,27 +21,51 @@ enum Error {
 struct MPEGPacket {
     _sync: u8,
     _flags: u8,
-    _pid: u16,
+    pid: u16,
     _payload: Vec<u8>,
 }
 
+impl MPEGPacket {
+    fn parse_from_stream(stream: &TransportStream) -> Result<Self, ParseError> {
+        let packet = stream.get_range::<PACKET_SIZE>();
+
+        let sync = packet[0];
+        if sync != SYNC_BYTE {
+            return Err(ParseError::InvalidPacket);
+        }
+
+        let flags = (packet[1] & 0xE0) >> 5;
+        let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
+        let payload = &packet[3..];
+
+        let packet = Self {
+            _sync: sync,
+            _flags: flags,
+            pid,
+            _payload: payload.to_vec(),
+        };
+
+        Ok(packet)
+    }
+}
+
 /// A wrapper around a stream, which could be a socket, or file
-struct TSStream {
+struct TransportStream {
     buffer: Vec<u8>,
     cursor: usize,
     pids: HashSet<u16>,
     packet_count: usize,
 }
 
-impl Iterator for TSStream {
-    type Item = Result<MPEGPacket, Error>;
+impl Iterator for TransportStream {
+    type Item = Result<MPEGPacket, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.read_packet()
     }
 }
 
-impl TSStream {
+impl TransportStream {
     /// Create a new `TSStream` wrapper around an underlying stream
     fn new<Stream>(mut stream: Stream) -> Self
     where
@@ -94,7 +118,7 @@ impl TSStream {
     /// Read a single packet from the provided stream
     ///
     /// NOTE: This uses a basic heuristic to check for partial packets.
-    fn read_packet(&mut self) -> Option<Result<MPEGPacket, Error>> {
+    fn read_packet(&mut self) -> Option<Result<MPEGPacket, ParseError>> {
         let byte = self.peek()?;
 
         // This is rather crude (and is very possibly not the correct approach), but
@@ -121,57 +145,43 @@ impl TSStream {
                             .is_none_or(|b| b == SYNC_BYTE)
                 {
                     // Then basically assume that this is the proper start of the next packet
-                    return Some(Err(Error::PartialPacket(self.cursor)));
+                    return Some(Err(ParseError::PartialPacket(self.cursor)));
                 }
 
                 self.next_byte();
             }
 
             // Otherwise, we can't find an obvious starting point, so it's invalid
-            return Some(Err(Error::InvalidPacket));
+            return Some(Err(ParseError::InvalidPacket));
         }
 
         // Grab the next packet out
-        let packet = self.get_range::<PACKET_SIZE>();
+        let packet = MPEGPacket::parse_from_stream(self);
 
-        let sync = packet[0];
-        // This should have been checked for above, but may as well play it safe ...
-        if sync != SYNC_BYTE {
-            return Some(Err(Error::InvalidPacket));
+        if let Ok(ref packet) = packet {
+            self.pids.insert(packet.pid);
+            self.packet_count += 1;
         }
 
-        let flags = (packet[1] & 0xE0) >> 5;
-        let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
-        let payload = &packet[3..];
-
-        let packet = MPEGPacket {
-            _sync: sync,
-            _flags: flags,
-            _pid: pid,
-            _payload: payload.to_vec(),
-        };
-
-        self.pids.insert(pid);
-        self.packet_count += 1;
         self.cursor += PACKET_SIZE;
 
-        Some(Ok(packet))
+        Some(packet)
     }
 }
 
 fn main() {
     let mut offset = 0;
 
-    let mut stream = TSStream::new(stdin());
+    let mut stream = TransportStream::new(stdin());
     match stream.next() {
         Some(Ok(_packet)) => {
             offset += PACKET_SIZE;
         }
-        Some(Err(Error::PartialPacket(off))) => {
+        Some(Err(ParseError::PartialPacket(off))) => {
             // Ignore the first packet if it's a partial packet
             offset += off;
         }
-        Some(Err(Error::InvalidPacket)) => {
+        Some(Err(ParseError::InvalidPacket)) => {
             // TODO: What should happen if the first packet is invalid? Discard it? Is it a partial packet?
             println!(
                 "Error: No sync byte present in packet {}, offset {offset}",
@@ -205,7 +215,7 @@ fn main() {
 mod test {
     use std::{collections::HashSet, io::Cursor};
 
-    use crate::{Error, MPEGPacket, PACKET_SIZE, SYNC_BYTE, TSStream};
+    use crate::{MPEGPacket, PACKET_SIZE, ParseError, SYNC_BYTE, TransportStream};
 
     #[test]
     fn single_packet() {
@@ -218,7 +228,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TSStream::new(packet);
+        let stream = TransportStream::new(packet);
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -228,7 +238,7 @@ mod test {
             Ok(MPEGPacket {
                 _sync: SYNC_BYTE,
                 _flags: 0,
-                _pid: 0,
+                pid: 0,
                 _payload: vec![0u8; 185],
             }),
             packet
@@ -254,7 +264,7 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TSStream::new(packet);
+        let stream = TransportStream::new(packet);
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
@@ -264,7 +274,7 @@ mod test {
             Ok(MPEGPacket {
                 _sync: SYNC_BYTE,
                 _flags: 0,
-                _pid: 0,
+                pid: 0,
                 _payload: vec![0u8; 185],
             }),
             packet
@@ -277,7 +287,7 @@ mod test {
             Ok(MPEGPacket {
                 _sync: SYNC_BYTE,
                 _flags: 0x7,
-                _pid: 0xFFF,
+                pid: 0xFFF,
                 _payload: vec![0u8; 185],
             }),
             packet
@@ -318,13 +328,13 @@ mod test {
 
         let packet = Cursor::new(&packet);
 
-        let stream = TSStream::new(packet);
+        let stream = TransportStream::new(packet);
         let mut stream = stream.into_iter();
         let packet = stream.next();
         assert!(packet.is_some());
 
         let packet = packet.unwrap();
-        assert_eq!(Err(Error::PartialPacket(OFFSET)), packet);
+        assert_eq!(Err(ParseError::PartialPacket(OFFSET)), packet);
 
         let packet = stream.next();
         assert!(packet.is_some());
@@ -333,7 +343,7 @@ mod test {
             Ok(MPEGPacket {
                 _sync: SYNC_BYTE,
                 _flags: 0x7,
-                _pid: 0xFFF,
+                pid: 0xFFF,
                 _payload: vec![0u8; 185],
             }),
             packet
@@ -345,7 +355,7 @@ mod test {
         let packets = include_bytes!("tests/test_success.ts");
 
         let stream = Cursor::new(&packets);
-        let mut stream = TSStream::new(stream);
+        let mut stream = TransportStream::new(stream);
 
         for packet in &mut stream {
             assert!(packet.is_ok());
@@ -362,7 +372,7 @@ mod test {
         let packets = include_bytes!("tests/test_failure.ts");
 
         let stream = Cursor::new(&packets);
-        let mut stream = TSStream::new(stream);
+        let mut stream = TransportStream::new(stream);
 
         let mut offset = 0;
 
