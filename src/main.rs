@@ -106,6 +106,16 @@ where
         self.buffer.read_exact(&mut buf[..])
     }
 
+    /// If we've found a sync byte, then if another sync byte exists
+    /// exactly 1 packet away, and another two exist (or there's not
+    /// enough data) at `PACKET_SIZE` offsets, then we can assume
+    /// that we are at a sync byte for the start of a new packet
+    fn at_starting_sync_byte(&mut self) -> bool {
+        self.get(PACKET_SIZE).is_none_or(|b| b == SYNC_BYTE)
+            && self.get(PACKET_SIZE * 2).is_none_or(|b| b == SYNC_BYTE)
+            && self.get(PACKET_SIZE * 3).is_none_or(|b| b == SYNC_BYTE)
+    }
+
     /// Read a single packet from the provided stream
     ///
     /// NOTE: This uses a basic heuristic to check for partial packets.
@@ -120,22 +130,8 @@ where
 
             // Only look up to 1 packet away
             for idx in 1..PACKET_SIZE {
-                if self.peek()? == SYNC_BYTE
-                        // If we've found a sync byte, then if another sync byte exists
-                        // exactly 1 packet away, ...
-                        && self
-                            .get(PACKET_SIZE)
-                            .is_some_and(|b| b == SYNC_BYTE)
-                        // and another two exist (or there's not enough data) at `PACKET_SIZE`
-                        // offsets ...
-                        && self
-                            .get(PACKET_SIZE * 2)
-                            .is_none_or(|b| b == SYNC_BYTE)
-                        && self
-                            .get(PACKET_SIZE * 3)
-                            .is_none_or(|b| b == SYNC_BYTE)
-                {
-                    // Then basically assume that this is the proper start of the next packet
+                if self.peek()? == SYNC_BYTE && self.at_starting_sync_byte() {
+                    // Assume that this is the proper start of the next packet
                     return Some(Err(ParseError::PartialPacket(idx)));
                 }
 

@@ -14,7 +14,7 @@ rustup default nightly # Installs the nightly toolchain,
 rustup update # Ensures everything is installed
 ```
 
-This should install everything you need to build, which can be done as follows:
+This should install everything you need to build. Then, assuming you have the repository checked out, from within the cloned repository, run:
 
 ```bash
 cargo build --release # Builds an optimised version
